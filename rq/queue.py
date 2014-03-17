@@ -130,9 +130,15 @@ class Queue(object):
                 self.connection.rpush(self.key, job_id)
 
 
-    def push_job_id(self, job_id):  # noqa
+    def push_job_id(self, job_id, job_description=''):  # noqa
         """Pushes a job ID on the corresponding Redis queue."""
-        self.connection.rpush(self.key, job_id)
+        
+        """If it is the orchestrator job, it should not have to wait
+        on other tasks in the same queue"""
+        if job_description.startswith('bioseq_tasks.orchestrator.orchestrator'):
+            self.connection.lpush(self.key, job_id)
+        else:
+            self.connection.rpush(self.key, job_id)
 
 
     def enqueue_call(self, func, args=None, kwargs=None, timeout=None,
@@ -227,7 +233,7 @@ class Queue(object):
         job.save()
 
         if self._async:
-            self.push_job_id(job.id)
+            self.push_job_id(job.id, job.description)
         else:
             job.perform()
             job.save()
