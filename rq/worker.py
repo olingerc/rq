@@ -1,26 +1,33 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 import errno
+import logging
+import os
 import random
+import signal
+import socket
+import sys
 import time
+import traceback
+
+from rq.compat import as_text, text_type
+
+from .connections import get_current_connection
+from .exceptions import DequeueTimeout, NoQueueError
+from .job import Job, Status
+from .logutils import setup_loghandlers
+from .queue import get_failed_queue, Queue
+from .timeouts import UnixSignalDeathPenalty
+from .utils import make_colorizer, utcformat, utcnow
+from .version import VERSION
+
 try:
     from procname import setprocname
 except ImportError:
     def setprocname(*args, **kwargs):  # noqa
         pass
-import socket
-import signal
-import traceback
-import logging
-from .queue import Queue, get_failed_queue
-from .connections import get_current_connection
-from .job import Job, Status
-from .utils import make_colorizer, utcnow, utcformat
-from .logutils import setup_loghandlers
-from .exceptions import NoQueueError, DequeueTimeout
-from .timeouts import death_penalty_after
-from .version import VERSION
-from rq.compat import text_type, as_text
 
 green = make_colorizer('darkgreen')
 yellow = make_colorizer('darkyellow')
@@ -59,6 +66,9 @@ def signal_name(signum):
 class Worker(object):
     redis_worker_namespace_prefix = 'rq:worker:'
     redis_workers_keys = 'rq:workers'
+    death_penalty_class = UnixSignalDeathPenalty
+    queue_class = Queue
+    job_class = Job
 
     @classmethod
     def all(cls, connection=None):
@@ -93,24 +103,31 @@ class Worker(object):
         worker._state = connection.hget(worker.key, 'state') or '?'
         worker._job_id = connection.hget(worker.key, 'current_job') or None
         if queues:
-            worker.queues = [Queue(queue, connection=connection)
+            worker.queues = [self.queue_class(queue, connection=connection)
                              for queue in queues.split(',')]
         return worker
 
     def __init__(self, queues, name=None,
-                 default_result_ttl=DEFAULT_RESULT_TTL, connection=None,
-                 exc_handler=None, default_worker_ttl=DEFAULT_WORKER_TTL):  # noqa
+                 default_result_ttl=None, connection=None,
+                 exc_handler=None, default_worker_ttl=None):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
-        if isinstance(queues, Queue):
+        if isinstance(queues, self.queue_class):
             queues = [queues]
         self._name = name
         self.queues = queues
         self.validate_queues()
         self._exc_handlers = []
+
+        if default_result_ttl is None:
+            default_result_ttl = DEFAULT_RESULT_TTL
         self.default_result_ttl = default_result_ttl
+
+        if default_worker_ttl is None:
+            default_worker_ttl = DEFAULT_WORKER_TTL
         self.default_worker_ttl = default_worker_ttl
+
         self._state = 'starting'
         self._is_horse = False
         self._horse_pid = 0
@@ -124,13 +141,12 @@ class Worker(object):
         if exc_handler is not None:
             self.push_exc_handler(exc_handler)
 
-
-    def validate_queues(self):  # noqa
+    def validate_queues(self):
         """Sanity check for the given queues."""
         if not iterable(self.queues):
             raise ValueError('Argument queues not iterable.')
         for queue in self.queues:
-            if not isinstance(queue, Queue):
+            if not isinstance(queue, self.queue_class):
                 raise NoQueueError('Give each worker at least one Queue.')
 
     def queue_names(self):
@@ -141,8 +157,7 @@ class Worker(object):
         """Returns the Redis keys representing this worker's queues."""
         return map(lambda q: q.key, self.queues)
 
-
-    @property  # noqa
+    @property
     def name(self):
         """Returns the name of the worker, under which it is registered to the
         monitoring system.
@@ -185,8 +200,7 @@ class Worker(object):
         """
         setprocname('rq: %s' % (message,))
 
-
-    def register_birth(self):  # noqa
+    def register_birth(self):
         """Registers its own birth."""
         self.log.debug('Registering birth of worker %s' % (self.name,))
         if self.connection.exists(self.key) and \
@@ -257,7 +271,7 @@ class Worker(object):
         if job_id is None:
             return None
 
-        return Job.fetch(job_id, self.connection)
+        return self.job_class.fetch(job_id, self.connection)
 
     @property
     def stopped(self):
@@ -310,8 +324,7 @@ class Worker(object):
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
 
-
-    def work(self, burst=False):  # noqa
+    def work(self, burst=False):
         """Starts the work loop.
 
         Pops and performs all jobs on the current list of queues.  When all
@@ -332,7 +345,7 @@ class Worker(object):
                 if self.stopped:
                     self.log.info('Stopping on request.')
                     break
-                
+
                 timeout = None if burst else max(1, self.default_worker_ttl - 60)
                 try:
                     result = self.dequeue_job_and_maintain_ttl(timeout)
@@ -357,21 +370,21 @@ class Worker(object):
     def dequeue_job_and_maintain_ttl(self, timeout):
         result = None
         qnames = self.queue_names()
-        
-        self.set_state('idle')            
+
+        self.set_state('idle')
         self.procline('Listening on %s' % ','.join(qnames))
         self.log.info('')
         self.log.info('*** Listening on %s...' %
                       green(', '.join(qnames)))
-        
+
         while True:
             self.heartbeat()
-                
+
             try:
-                result = Queue.dequeue_any(self.queues, timeout,
+                result = self.queue_class.dequeue_any(self.queues, timeout,
                                            connection=self.connection)
                 if result is not None:
-                    job, queue = result                
+                    job, queue = result
                     self.log.info('%s: %s (%s)' % (green(queue.name),
                                   blue(job.description), job.id))
 
@@ -453,29 +466,29 @@ class Worker(object):
         """
 
         self.set_state('busy')
-        self.set_current_job_id(job.id)        
+        self.set_current_job_id(job.id)
         self.heartbeat((job.timeout or 180) + 60)
-        
+
         self.procline('Processing %s from %s since %s' % (
             job.func_name,
             job.origin, time.time()))
 
         with self.connection._pipeline() as pipeline:
             try:
-                with death_penalty_after(job.timeout or Queue.DEFAULT_TIMEOUT):
+                with self.death_penalty_class(job.timeout or self.queue_class.DEFAULT_TIMEOUT):
                     rv = job.perform()
 
                 # Pickle the result in the same try-except block since we need to
                 # use the same exc handling when pickling fails
                 job._result = rv
-                
+
                 self.set_current_job_id(None, pipeline=pipeline)
 
                 result_ttl = job.get_ttl(self.default_result_ttl)
                 if result_ttl != 0:
                     job.save(pipeline=pipeline)
                 job.cleanup(result_ttl, pipeline=pipeline)
-                
+
                 pipeline.execute()
 
             except Exception:
